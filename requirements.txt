@@ -1,0 +1,5 @@
+streamlit
+weasyprint
+jinja2
+python-docx
+google-genai
