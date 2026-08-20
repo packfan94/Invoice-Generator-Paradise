@@ -1,13 +1,11 @@
 import streamlit as st
 import base64
-import json
 import os
+import re
 from datetime import datetime
 from jinja2 import Template
 import weasyprint
 from docx import Document
-from google import genai
-from google.genai import types
 
 st.set_page_config(page_title="Paradise Bar Events - Invoice Generator", layout="centered")
 
@@ -282,8 +280,8 @@ INVOICE_HTML_TEMPLATE = """
         <tr><td class="sum-label">Coordination Fee ({{ coord_rate }}):</td><td class="sum-val">${{ coord_fee }}</td></tr>
         <tr><td class="sum-label">Sales Tax ({{ tax_rate }}):</td><td class="sum-val">${{ tax_amount }}</td></tr>
         <tr><td class="sum-label">TOTAL:</td><td class="sum-val">${{ gross_total }}</td></tr>
-        {% if discount and discount != '0.00' and discount != '$0.00' %}
-        <tr><td class="sum-label" style="color: #4b6b4b;">Special approved discount:</td><td class="sum-val" style="color: #4b6b4b;">-{{ discount }}</td></tr>
+        {% if discount and discount != '0.00' %}
+        <tr><td class="sum-label" style="color: #4b6b4b;">Special approved discount:</td><td class="sum-val" style="color: #4b6b4b;">-${{ discount }}</td></tr>
         {% endif %}
         <tr class="sum-total-row"><td class="sum-label" style="color: #2c3036;">Discounted Total:</td><td class="sum-val">${{ final_total }}</td></tr>
         <tr class="sum-due-row"><td style="color: #ffffff; text-align: right;">AMOUNT DUE (50%):</td><td style="color: #ffffff; text-align: right;" class="sum-val">${{ amount_due_50 }}</td></tr>
@@ -299,42 +297,139 @@ INVOICE_HTML_TEMPLATE = """
 </html>
 """
 
-st.title("🍹 Paradise Bar Events — Invoice Generator")
+def parse_quote_docx(file_bytes):
+    doc = Document(file_bytes)
+    full_text = "\n".join([p.text for p in doc.paragraphs if p.text])
+    
+    # Extract client and event info using regex
+    def extract_field(pattern, default=""):
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        return match.group(1).strip() if match else default
+
+    client_name = extract_field(r"Client:\s*\n*(.*?)(?=\n|Contact:)", "Valued Client")
+    contact_name = extract_field(r"Contact:\s*\n*(.*?)(?=\n|Phone:)", client_name)
+    phone = extract_field(r"Phone\s*\n*(.*?)(?=\n|Email)", "")
+    email = extract_field(r"Email\s*\n*(.*?)(?=\n|Event Theme|Guest Count)", "")
+    location = extract_field(r"Location\s*\n*(.*?)(?=\n|Specialty Bar|Open Bar)", "")
+    location = location.replace("\n", "<br>")
+
+    event_name = extract_field(r"Event Name\s*\n*(.*?)(?=\n|Date)", "Special Event")
+    event_date = extract_field(r"Date\s*\n*(.*?)(?=\n|Start Time)", "")
+    start_time = extract_field(r"Start Time\s*\n*(.*?)(?=\n|End Time)", "")
+    end_time = extract_field(r"End Time\s*\n*(.*?)(?=\n|Phone|Event Theme)", "")
+    start_time = start_time.replace("\n", "<br>")
+    end_time = end_time.replace("\n", "<br>")
+    
+    theme = extract_field(r"Event Theme\s*\n*(.*?)(?=\n|Guest Count)", "")
+    guest_count = extract_field(r"Guest Count\s*\n*(.*?)(?=\n|Location)", "")
+
+    # Extract Specialty Bar section text
+    spec_bar_raw = extract_field(r"(?:Specialty Bar|Open Bar for First Hour)[\s\S]*?(?=Event Items & Costing)", "")
+    spec_lines = [l.strip() for l in spec_bar_raw.split("\n") if l.strip()]
+    specialty_bar_html = "<br>".join(spec_lines)
+
+    # Extract Included and Excluded
+    inc_raw = extract_field(r"Included\s*\n*([\s\S]*?)(?=Excluded)", "")
+    exc_raw = extract_field(r"Excluded \(Client Provides\)\s*\n*([\s\S]*?)(?=Cost Breakdown)", "")
+    
+    included_html = "<br>".join([l.strip() for l in inc_raw.split("\n") if l.strip()])
+    excluded_html = "<br>".join([l.strip() for l in exc_raw.split("\n") if l.strip()])
+
+    # Extract Financials and Line Items from Document Tables
+    line_items = []
+    subtotal = "0.00"
+    coord_rate = "19%"
+    coord_fee = "0.00"
+    tax_rate = "9.50%"
+    tax_amount = "0.00"
+    gross_total = "0.00"
+    discount = "0.00"
+    final_total = "0.00"
+
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            row_str = " ".join(cells)
+            
+            if "Sub-total" in row_str or "Subtotal" in row_str:
+                for c in reversed(cells):
+                    if "$" in c or re.search(r"\d+\.\d{2}", c):
+                        subtotal = c.replace("$", "").strip()
+                        break
+            elif "Coordination Fee" in row_str:
+                for c in cells:
+                    if "%" in c:
+                        coord_rate = c
+                    elif "$" in c or re.search(r"\d+\.\d{2}", c):
+                        coord_fee = c.replace("$", "").strip()
+            elif "Tax" in row_str:
+                for c in cells:
+                    if "%" in c or "[" in c:
+                        tax_rate = c
+                    elif "$" in c or re.search(r"\d+\.\d{2}", c):
+                        tax_amount = c.replace("$", "").strip()
+            elif "TOTAL" in row_str and "DISCOUNT" not in row_str and "REVISED" not in row_str:
+                for c in reversed(cells):
+                    if "$" in c or re.search(r"\d+\.\d{2}", c):
+                        gross_total = c.replace("$", "").strip()
+                        break
+            elif "discount" in row_str.lower():
+                for c in reversed(cells):
+                    if "$" in c or re.search(r"\d+\.\d{2}", c):
+                        discount = c.replace("$", "").replace("-", "").strip()
+                        break
+            elif "Discounted Total" in row_str or "REVISED TOTAL" in row_str:
+                for c in reversed(cells):
+                    if "$" in c or re.search(r"\d+\.\d{2}", c):
+                        final_total = c.replace("$", "").strip()
+                        break
+            elif len(cells) >= 3 and any(char.isdigit() for char in row_str):
+                # Probable cost breakdown item
+                if not any(k in row_str for k in ["Sub-total", "Fee", "Tax", "TOTAL", "discount", "Included", "Excluded"]):
+                    line_items.append({
+                        "desc": cells[0].replace("\n", "<br>"),
+                        "qty": cells[1] if len(cells) > 1 else "",
+                        "price": cells[2] if len(cells) > 2 else "",
+                        "extended": cells[3] if len(cells) > 3 else ""
+                    })
+
+    if final_total == "0.00" and gross_total != "0.00":
+        final_total = gross_total
+
+    return {
+        "client_name": client_name,
+        "contact_name": contact_name,
+        "phone": phone,
+        "email": email,
+        "location": location,
+        "event_name": event_name,
+        "event_date": event_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "theme": theme,
+        "guest_count": guest_count,
+        "specialty_bar_html": specialty_bar_html,
+        "included_html": included_html,
+        "excluded_html": excluded_html,
+        "line_items": line_items,
+        "subtotal": subtotal,
+        "coord_rate": coord_rate,
+        "coord_fee": coord_fee,
+        "tax_rate": tax_rate,
+        "tax_amount": tax_amount,
+        "gross_total": gross_total,
+        "discount": discount,
+        "final_total": final_total
+    }
+
+st.title("Paradise Bar Events — Invoice Generator")
 
 uploaded_file = st.file_uploader("Upload Word Quote (.docx)", type=["docx"])
 
 if uploaded_file:
-    doc = Document(uploaded_file)
-    full_text = "\n".join([p.text for p in doc.paragraphs if p.text] + [c.text for t in doc.tables for r in t.rows for c in r.cells if c.text])
-    
-    with st.spinner("Extracting quote details..."):
-        api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
-        client = genai.Client(api_key=api_key)
+    with st.spinner("Processing document..."):
+        data = parse_quote_docx(uploaded_file)
         
-        prompt = f"""
-        Extract the quote details into structured JSON matching these exact keys:
-        - client_name, contact_name, phone, email, location
-        - event_name, event_date, start_time, end_time, theme, guest_count
-        - specialty_bar_html (verbatim HTML snippet preserving original wording and bullet formatting)
-        - included_html (verbatim HTML snippet preserving original wording)
-        - excluded_html (verbatim HTML snippet preserving original wording)
-        - line_items: array of objects with keys [desc, qty, price, extended]
-        - subtotal, coord_rate, coord_fee, tax_rate, tax_amount, gross_total, discount, final_total (numeric string values only without $ signs)
-        
-        Quote Document Content:
-        {full_text}
-        """
-
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0
-            )
-        )
-        data = json.loads(response.text)
-
         final_clean = str(data.get("final_total", "0")).replace(",", "").replace("$", "").strip()
         final_float = float(final_clean) if final_clean else 0.0
         amount_due_50 = f"{final_float * 0.5:,.2f}"
@@ -355,9 +450,9 @@ if uploaded_file:
 
         pdf_bytes = weasyprint.HTML(string=rendered_html).write_pdf()
 
-    st.success("Invoice generated!")
+    st.success("Invoice generated successfully!")
     st.download_button(
-        label="📥 Download 1-Page PDF Invoice",
+        label="Download 1-Page PDF Invoice",
         data=pdf_bytes,
         file_name=f"Invoice_{data.get('client_name', 'Event').replace(' ', '_')}.pdf",
         mime="application/pdf"
