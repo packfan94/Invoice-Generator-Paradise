@@ -299,12 +299,27 @@ INVOICE_HTML_TEMPLATE = """
 
 def parse_quote_docx(file_bytes):
     doc = Document(file_bytes)
-    full_text = "\n".join([p.text for p in doc.paragraphs if p.text])
     
-    # Extract client and event info using regex
+    # Collect all text from paragraphs and table cells
+    doc_lines = []
+    for p in doc.paragraphs:
+        if p.text.strip():
+            doc_lines.append(p.text.strip())
+    for t in doc.tables:
+        for row in t.rows:
+            for c in row.cells:
+                if c.text.strip() and c.text.strip() not in doc_lines:
+                    doc_lines.append(c.text.strip())
+                    
+    full_text = "\n".join(doc_lines)
+    
     def extract_field(pattern, default=""):
         match = re.search(pattern, full_text, re.IGNORECASE)
-        return match.group(1).strip() if match else default
+        if match:
+            if match.groups():
+                return match.group(1).strip()
+            return match.group(0).strip()
+        return default
 
     client_name = extract_field(r"Client:\s*\n*(.*?)(?=\n|Contact:)", "Valued Client")
     contact_name = extract_field(r"Contact:\s*\n*(.*?)(?=\n|Phone:)", client_name)
@@ -323,8 +338,8 @@ def parse_quote_docx(file_bytes):
     theme = extract_field(r"Event Theme\s*\n*(.*?)(?=\n|Guest Count)", "")
     guest_count = extract_field(r"Guest Count\s*\n*(.*?)(?=\n|Location)", "")
 
-    # Extract Specialty Bar section text
-    spec_bar_raw = extract_field(r"(?:Specialty Bar|Open Bar for First Hour)[\s\S]*?(?=Event Items & Costing)", "")
+    # Extract Specialty Bar section text safely
+    spec_bar_raw = extract_field(r"((?:Specialty Bar|Open Bar for First Hour)[\s\S]*?)(?=Event Items & Costing)", "")
     spec_lines = [l.strip() for l in spec_bar_raw.split("\n") if l.strip()]
     specialty_bar_html = "<br>".join(spec_lines)
 
@@ -335,7 +350,6 @@ def parse_quote_docx(file_bytes):
     included_html = "<br>".join([l.strip() for l in inc_raw.split("\n") if l.strip()])
     excluded_html = "<br>".join([l.strip() for l in exc_raw.split("\n") if l.strip()])
 
-    # Extract Financials and Line Items from Document Tables
     line_items = []
     subtotal = "0.00"
     coord_rate = "19%"
@@ -384,7 +398,6 @@ def parse_quote_docx(file_bytes):
                         final_total = c.replace("$", "").strip()
                         break
             elif len(cells) >= 3 and any(char.isdigit() for char in row_str):
-                # Probable cost breakdown item
                 if not any(k in row_str for k in ["Sub-total", "Fee", "Tax", "TOTAL", "discount", "Included", "Excluded"]):
                     line_items.append({
                         "desc": cells[0].replace("\n", "<br>"),
